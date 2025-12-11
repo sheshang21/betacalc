@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tools import add_constant
 import warnings
+import time
 
 warnings.filterwarnings('ignore')
 
@@ -42,43 +43,90 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Functions
-@st.cache_data(ttl=3600)
-def fetch_data(ticker, start_date, end_date, frequency='1d'):
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_data_with_retry(ticker, start_date, end_date, frequency='1d', max_retries=3):
     """
-    Fetch stock and NIFTY data from Yahoo Finance
+    Fetch stock and NIFTY data with retry logic and exponential backoff
     
     Parameters:
     - ticker: NSE stock ticker (without .NS)
     - start_date: Start date for data
     - end_date: End date for data
     - frequency: '1d', '1wk', or '1mo'
+    - max_retries: Maximum number of retry attempts
     
     Returns:
     - stock_data: DataFrame with stock prices
     - nifty_data: DataFrame with NIFTY prices
     """
-    try:
-        # Add .NS suffix for NSE stocks
-        stock_ticker = f"{ticker}.NS"
-        nifty_ticker = "^NSEI"
-        
-        # Fetch data
-        stock = yf.Ticker(stock_ticker)
-        nifty = yf.Ticker(nifty_ticker)
-        
-        stock_data = stock.history(start=start_date, end=end_date, interval=frequency)
-        nifty_data = nifty.history(start=start_date, end=end_date, interval=frequency)
-        
-        if stock_data.empty:
-            raise ValueError(f"No data found for ticker {stock_ticker}. Please check if the ticker is valid.")
-        
-        if nifty_data.empty:
-            raise ValueError("Unable to fetch NIFTY index data.")
-        
-        return stock_data, nifty_data, stock_ticker
-        
-    except Exception as e:
-        raise Exception(f"Error fetching data: {str(e)}")
+    stock_ticker = f"{ticker}.NS"
+    nifty_ticker = "^NSEI"
+    
+    for attempt in range(max_retries):
+        try:
+            # Add delay between attempts to avoid rate limiting
+            if attempt > 0:
+                wait_time = 2 ** attempt  # Exponential backoff: 2, 4, 8 seconds
+                time.sleep(wait_time)
+            
+            # Download stock data
+            stock_data = yf.download(
+                stock_ticker,
+                start=start_date,
+                end=end_date,
+                interval=frequency,
+                progress=False,
+                show_errors=False
+            )
+            
+            # Small delay between requests
+            time.sleep(0.5)
+            
+            # Download NIFTY data
+            nifty_data = yf.download(
+                nifty_ticker,
+                start=start_date,
+                end=end_date,
+                interval=frequency,
+                progress=False,
+                show_errors=False
+            )
+            
+            # Validate data
+            if stock_data.empty:
+                raise ValueError(f"No data found for ticker {stock_ticker}. Please verify the ticker symbol is correct.")
+            
+            if nifty_data.empty:
+                raise ValueError("Unable to fetch NIFTY index data. Please try again later.")
+            
+            # Handle multi-level columns if present
+            if isinstance(stock_data.columns, pd.MultiIndex):
+                stock_data.columns = stock_data.columns.droplevel(1)
+            if isinstance(nifty_data.columns, pd.MultiIndex):
+                nifty_data.columns = nifty_data.columns.droplevel(1)
+            
+            return stock_data, nifty_data, stock_ticker
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            
+            # Check if it's a rate limit error
+            if 'rate limit' in error_msg or 'too many requests' in error_msg or '429' in error_msg:
+                if attempt < max_retries - 1:
+                    continue  # Retry
+                else:
+                    raise Exception(
+                        "Yahoo Finance rate limit exceeded. Please try one of these solutions:\n"
+                        "1. Wait 1-2 minutes and try again\n"
+                        "2. Use a longer time period (Weekly/Monthly instead of Daily)\n"
+                        "3. Reduce the date range\n"
+                        "4. Try a different stock ticker first"
+                    )
+            else:
+                # For other errors, raise immediately
+                raise Exception(f"Error fetching data: {str(e)}")
+    
+    raise Exception("Failed to fetch data after multiple attempts. Please try again later.")
 
 def calculate_returns(stock_data, nifty_data):
     """
@@ -301,7 +349,12 @@ def main():
         'Weekly': '1wk',
         'Monthly': '1mo'
     }
-    frequency_label = st.sidebar.selectbox("Data Frequency", list(frequency_map.keys()))
+    frequency_label = st.sidebar.selectbox(
+        "Data Frequency",
+        list(frequency_map.keys()),
+        index=0,
+        help="📌 Use Weekly/Monthly if you encounter rate limit errors"
+    )
     frequency = frequency_map[frequency_label]
     
     # Time Period Selection
@@ -321,12 +374,22 @@ def main():
     else:
         col1, col2 = st.sidebar.columns(2)
         with col1:
-            start_date = st.date_input("Start Date", datetime.now() - timedelta(days=1825))
+            start_date = st.date_input("Start Date", datetime.now() - timedelta(days=1095))
         with col2:
             end_date = st.date_input("End Date", datetime.now())
     
     # Calculate Button
     calculate_btn = st.sidebar.button("🚀 Calculate Beta", type="primary", use_container_width=True)
+    
+    # Info box about rate limits
+    with st.sidebar.expander("ℹ️ Troubleshooting Rate Limits"):
+        st.markdown("""
+        **If you see rate limit errors:**
+        1. Wait 1-2 minutes before retrying
+        2. Use Weekly/Monthly frequency
+        3. Try a shorter date range
+        4. Clear cache from the menu (⋮) → Clear cache
+        """)
     
     # Main Content
     if calculate_btn:
@@ -335,15 +398,28 @@ def main():
             return
         
         try:
-            # Progress
-            with st.spinner(f'Fetching data for {ticker}...'):
-                stock_data, nifty_data, full_ticker = fetch_data(ticker, start_date, end_date, frequency)
+            # Progress with status updates
+            status_placeholder = st.empty()
+            progress_bar = st.progress(0)
             
-            with st.spinner('Calculating returns...'):
-                returns_df = calculate_returns(stock_data, nifty_data)
+            status_placeholder.info(f'🔄 Fetching data for {ticker}... (This may take 10-15 seconds)')
+            progress_bar.progress(20)
             
-            with st.spinner('Running regression analysis...'):
-                results, model = calculate_beta(returns_df)
+            stock_data, nifty_data, full_ticker = fetch_data_with_retry(
+                ticker, start_date, end_date, frequency
+            )
+            progress_bar.progress(50)
+            
+            status_placeholder.info('📊 Calculating returns...')
+            returns_df = calculate_returns(stock_data, nifty_data)
+            progress_bar.progress(70)
+            
+            status_placeholder.info('📈 Running regression analysis...')
+            results, model = calculate_beta(returns_df)
+            progress_bar.progress(100)
+            
+            status_placeholder.empty()
+            progress_bar.empty()
             
             st.success(f'✅ Analysis completed for {full_ticker}')
             
@@ -458,7 +534,19 @@ def main():
             
         except Exception as e:
             st.error(f"❌ Error: {str(e)}")
-            st.info("💡 Please check the ticker symbol and try again. Make sure it's a valid NSE-listed stock.")
+            
+            # Provide helpful suggestions
+            if 'rate limit' in str(e).lower() or 'too many requests' in str(e).lower():
+                st.warning("""
+                **💡 Rate Limit Solutions:**
+                - ⏱️ Wait 1-2 minutes before trying again
+                - 📅 Use **Weekly** or **Monthly** frequency instead of Daily
+                - 📉 Try a shorter date range (e.g., 1 year instead of 5 years)
+                - 🔄 Clear the cache: Menu (⋮) → Settings → Clear cache
+                - 🔁 Try a different stock ticker first
+                """)
+            else:
+                st.info("💡 Please check the ticker symbol and try again. Make sure it's a valid NSE-listed stock.")
     
     else:
         # Welcome Message
@@ -476,6 +564,8 @@ def main():
         - **β = 1**: Stock moves in line with the market
         - **β < 1**: Stock is less volatile than the market
         - **β < 0**: Stock moves inversely to the market
+        
+        **⚠️ Important:** If you encounter rate limit errors, use Weekly/Monthly frequency or wait 1-2 minutes between requests.
         """)
         
         st.subheader("📊 Example Tickers")
@@ -490,7 +580,7 @@ def main():
             st.markdown("**IT Sector**")
             st.code("WIPRO\nHCLTECH\nTECHM\nLTIM\nCOFORGE")
 
-# Footer
+    # Footer
     st.markdown("---")
     st.markdown("""
         <div style='text-align: center; color: #666;'>
