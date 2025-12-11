@@ -44,13 +44,12 @@ st.markdown("""
 
 # Functions
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_data_with_retry(ticker, benchmark_ticker, start_date, end_date, frequency='1d', max_retries=3):
+def fetch_data_with_retry(ticker, start_date, end_date, frequency='1d', max_retries=3):
     """
-    Fetch stock and benchmark index data with retry logic and exponential backoff
+    Fetch stock and NIFTY data with retry logic and exponential backoff
     
     Parameters:
     - ticker: NSE stock ticker (without .NS)
-    - benchmark_ticker: Benchmark index ticker
     - start_date: Start date for data
     - end_date: End date for data
     - frequency: '1d', '1wk', or '1mo'
@@ -58,9 +57,10 @@ def fetch_data_with_retry(ticker, benchmark_ticker, start_date, end_date, freque
     
     Returns:
     - stock_data: DataFrame with stock prices
-    - index_data: DataFrame with benchmark index prices
+    - nifty_data: DataFrame with NIFTY prices
     """
     stock_ticker = f"{ticker}.NS"
+    nifty_ticker = "^NSEI"
     
     for attempt in range(max_retries):
         try:
@@ -81,9 +81,9 @@ def fetch_data_with_retry(ticker, benchmark_ticker, start_date, end_date, freque
             # Small delay between requests
             time.sleep(0.5)
             
-            # Download benchmark index data
-            index_data = yf.download(
-                benchmark_ticker,
+            # Download NIFTY data
+            nifty_data = yf.download(
+                nifty_ticker,
                 start=start_date,
                 end=end_date,
                 interval=frequency,
@@ -94,16 +94,16 @@ def fetch_data_with_retry(ticker, benchmark_ticker, start_date, end_date, freque
             if stock_data.empty:
                 raise ValueError(f"No data found for ticker {stock_ticker}. Please verify the ticker symbol is correct.")
             
-            if index_data.empty:
-                raise ValueError(f"Unable to fetch benchmark index data ({benchmark_ticker}). Please try again later.")
+            if nifty_data.empty:
+                raise ValueError("Unable to fetch NIFTY index data. Please try again later.")
             
             # Handle multi-level columns if present
             if isinstance(stock_data.columns, pd.MultiIndex):
                 stock_data.columns = stock_data.columns.droplevel(1)
-            if isinstance(index_data.columns, pd.MultiIndex):
-                index_data.columns = index_data.columns.droplevel(1)
+            if isinstance(nifty_data.columns, pd.MultiIndex):
+                nifty_data.columns = nifty_data.columns.droplevel(1)
             
-            return stock_data, index_data, stock_ticker
+            return stock_data, nifty_data, stock_ticker
             
         except Exception as e:
             error_msg = str(e).lower()
@@ -126,13 +126,13 @@ def fetch_data_with_retry(ticker, benchmark_ticker, start_date, end_date, freque
     
     raise Exception("Failed to fetch data after multiple attempts. Please try again later.")
 
-def calculate_returns(stock_data, index_data):
+def calculate_returns(stock_data, nifty_data):
     """
     Calculate percentage returns and align data
     
     Parameters:
     - stock_data: DataFrame with stock prices
-    - index_data: DataFrame with benchmark index prices
+    - nifty_data: DataFrame with NIFTY prices
     
     Returns:
     - combined_df: DataFrame with aligned returns
@@ -140,12 +140,12 @@ def calculate_returns(stock_data, index_data):
     try:
         # Calculate percentage returns
         stock_returns = stock_data['Close'].pct_change() * 100
-        index_returns = index_data['Close'].pct_change() * 100
+        nifty_returns = nifty_data['Close'].pct_change() * 100
         
         # Create DataFrame
         returns_df = pd.DataFrame({
             'Stock_Return': stock_returns,
-            'Index_Return': index_returns
+            'Nifty_Return': nifty_returns
         })
         
         # Remove missing values
@@ -164,7 +164,7 @@ def calculate_beta(returns_df):
     Calculate Beta using OLS regression
     
     Parameters:
-    - returns_df: DataFrame with stock and index returns
+    - returns_df: DataFrame with stock and nifty returns
     
     Returns:
     - results_dict: Dictionary with regression statistics
@@ -173,20 +173,20 @@ def calculate_beta(returns_df):
     try:
         # Prepare data for regression
         y = returns_df['Stock_Return']
-        X = add_constant(returns_df['Index_Return'])
+        X = add_constant(returns_df['Nifty_Return'])
         
         # Fit OLS model
         model = OLS(y, X).fit()
         
         # Extract statistics
         results_dict = {
-            'beta': model.params['Index_Return'],
+            'beta': model.params['Nifty_Return'],
             'alpha': model.params['const'],
             'r_squared': model.rsquared,
-            'std_error': model.bse['Index_Return'],
-            'p_value': model.pvalues['Index_Return'],
-            'conf_int_lower': model.conf_int().loc['Index_Return', 0],
-            'conf_int_upper': model.conf_int().loc['Index_Return', 1],
+            'std_error': model.bse['Nifty_Return'],
+            'p_value': model.pvalues['Nifty_Return'],
+            'conf_int_lower': model.conf_int().loc['Nifty_Return', 0],
+            'conf_int_upper': model.conf_int().loc['Nifty_Return', 1],
             'observations': len(returns_df)
         }
         
@@ -340,28 +340,6 @@ def main():
         value="RELIANCE",
         help="Enter NSE ticker without .NS suffix (e.g., RELIANCE, TCS, HDFCBANK)"
     ).upper()
-    
-    # Benchmark Index Selection
-    st.sidebar.subheader("📈 Benchmark Index")
-    index_options = {
-        'NIFTY 50': '^NSEI',
-        'NIFTY 500': '^CRSLDX',
-        'NIFTY Bank': '^NSEBANK',
-        'NIFTY IT': '^CNXIT',
-        'NIFTY Midcap 100': '^NSEMDCP100',
-        'NIFTY Smallcap 100': '^NSESMLCP100',
-        'BSE SENSEX': '^BSESN',
-        'S&P 500 (USD)': '^GSPC',
-        'NASDAQ (USD)': '^IXIC'
-    }
-    
-    selected_index_name = st.sidebar.selectbox(
-        "Select Market Index",
-        list(index_options.keys()),
-        index=0,
-        help="Choose the benchmark index for beta calculation"
-    )
-    benchmark_ticker = index_options[selected_index_name]
     
     # Frequency Selection
     frequency_map = {
