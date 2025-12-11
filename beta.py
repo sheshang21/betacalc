@@ -75,8 +75,7 @@ def fetch_data_with_retry(ticker, start_date, end_date, frequency='1d', max_retr
                 start=start_date,
                 end=end_date,
                 interval=frequency,
-                progress=False,
-                show_errors=False
+                progress=False
             )
             
             # Small delay between requests
@@ -88,8 +87,7 @@ def fetch_data_with_retry(ticker, start_date, end_date, frequency='1d', max_retr
                 start=start_date,
                 end=end_date,
                 interval=frequency,
-                progress=False,
-                show_errors=False
+                progress=False
             )
             
             # Validate data
