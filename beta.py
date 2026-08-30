@@ -107,10 +107,12 @@ def calc_metrics(stock, bench, rets, rf=6.5):
     # --- Systematic vs Unsystematic risk decomposition (sigma_i^2 = beta^2*sigma_m^2 + sigma_eps^2) ---
     r['total_var'] = r['annual_vol'] ** 2
     r['systematic_var'] = (r['beta'] ** 2) * (r['mkt_annual_vol'] ** 2)
-    r['unsystematic_var'] = max(r['total_var'] - r['systematic_var'], 0)
+    r['raw_unsystematic_var'] = r['total_var'] - r['systematic_var']   # can be negative due to estimation noise
+    r['unsys_clipped'] = r['raw_unsystematic_var'] < 0
+    r['unsystematic_var'] = max(r['raw_unsystematic_var'], 0)
     r['systematic_risk'] = np.sqrt(r['systematic_var'])          # beta * sigma_m, annualized
     r['unsystematic_risk'] = np.sqrt(r['unsystematic_var'])      # sqrt(sigma_i^2 - beta^2*sigma_m^2)
-    r['systematic_share'] = r['systematic_var'] / r['total_var'] if r['total_var'] != 0 else 0  # ~ R^2
+    r['systematic_share'] = min(r['systematic_var'] / r['total_var'], 1) if r['total_var'] != 0 else 0  # ~ R^2, capped at 100%
     r['unsystematic_share'] = 1 - r['systematic_share']
     return r, m
 
@@ -135,7 +137,43 @@ def recommend(r):
     else: final = ("AVOID", "Weak metrics", "rec-sell")
     return recs, final, score
 
-def plot_reg(rets, m, t, bench_name):
+def interpret_risk_decomp(r, t, bench_name):
+    """Interpretation strings generated purely from this run's computed numbers — no fixed/canned claims."""
+    lines = []
+    b = r['beta']
+
+    # Beta / sensitivity read
+    if b > 1.2:
+        lines.append(f"**Sensitivity:** β = {b:.2f} means {t} has historically moved about {b:.2f}× as much as {bench_name} — moves in the index tend to be amplified in {t}.")
+    elif b < 0.8:
+        lines.append(f"**Sensitivity:** β = {b:.2f} means {t} has historically moved about {b:.2f}× as much as {bench_name} — moves in the index tend to be dampened in {t}.")
+    else:
+        lines.append(f"**Sensitivity:** β = {b:.2f} is close to 1 — {t} has historically moved roughly in step with {bench_name}.")
+
+    # Systematic share read
+    ss = r['systematic_share']
+    if ss >= 0.7:
+        lines.append(f"**Systematic share:** {ss*100:.1f}% of {t}'s return variance over this period lines up with moves in {bench_name}. Most of the stock's historical risk has been market-driven, not company-specific.")
+    elif ss >= 0.3:
+        lines.append(f"**Systematic share:** {ss*100:.1f}% of {t}'s return variance lines up with {bench_name}, and {r['unsystematic_share']*100:.1f}% does not. Market moves and company-specific factors have both contributed meaningfully.")
+    else:
+        lines.append(f"**Systematic share:** only {ss*100:.1f}% of {t}'s return variance lines up with {bench_name}. Over this period, most of the variation in {t}'s returns has not tracked the index.")
+
+    # Magnitude read (systematic vs unsystematic risk, in %)
+    if r['systematic_risk'] > r['unsystematic_risk']:
+        lines.append(f"**Magnitude:** the systematic component ({r['systematic_risk']:.2f}% annualized) is larger than the unsystematic component ({r['unsystematic_risk']:.2f}%) — market-wide swings account for more of {t}'s annualized volatility than stock-specific swings do.")
+    else:
+        lines.append(f"**Magnitude:** the unsystematic component ({r['unsystematic_risk']:.2f}% annualized) is larger than the systematic component ({r['systematic_risk']:.2f}%) — stock-specific swings account for more of {t}'s annualized volatility than market-wide swings do.")
+
+    # What this generally means (standard finance-theory framing, not a claim about future performance)
+    lines.append(f"**Diversification angle:** the systematic component ({r['systematic_risk']:.2f}%) reflects exposure to {bench_name} and, by definition, cannot be removed by holding more stocks — it's the risk every diversified portfolio still carries. The unsystematic component ({r['unsystematic_risk']:.2f}%) is specific to {t} and is the part that diversification (holding many uncorrelated stocks) can reduce.")
+
+    if r['unsys_clipped']:
+        lines.append(f"**Note:** the raw calculation (σᵢ² − β²σₘ²) came out slightly negative ({r['raw_unsystematic_var']:.4f}), so unsystematic risk was floored at 0%. This happens when β and total volatility are estimated independently and the fit is very tight (R² = {r['r_squared']*100:.1f}%) — it reflects estimation noise between the two separately-computed quantities, not a real negative variance.")
+
+    return lines
+
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=rets['Bench_Return'], y=rets['Stock_Return'],
                             mode='markers', name='Returns', marker=dict(size=5, opacity=0.5)))
@@ -298,6 +336,29 @@ if page == "Stock Analysis":
             c3.metric("Systematic Share", f"{r['systematic_share']*100:.1f}%", help="Systematic variance / Total variance ≈ R²")
             c4.metric("Unsystematic Share", f"{r['unsystematic_share']*100:.1f}%", help="1 − Systematic Share")
 
+            with st.expander("🧠 Interpretation", expanded=True):
+                for line in interpret_risk_decomp(r, ft, benchmark_name):
+                    st.markdown(f"- {line}")
+
+            with st.expander("🔎 Full Breakdown — Step by Step", expanded=False):
+                st.markdown(f"**1. Total risk (σᵢ)** — annualized std. dev. of {ft}'s returns:")
+                st.latex(rf"\sigma_i = {r['annual_vol']:.4f}\% \;\Rightarrow\; \sigma_i^2 = {r['total_var']:.4f}")
+                st.markdown(f"**2. Beta (β)** — regression slope of {ft} on {benchmark_name}:")
+                st.latex(rf"\beta = {r['beta']:.4f}")
+                st.markdown(f"**3. Market risk (σₘ)** — annualized std. dev. of {benchmark_name}'s returns:")
+                st.latex(rf"\sigma_m = {r['mkt_annual_vol']:.4f}\% \;\Rightarrow\; \sigma_m^2 = {r['mkt_annual_vol']**2:.4f}")
+                st.markdown("**4. Systematic variance and risk:**")
+                st.latex(rf"\beta^2\sigma_m^2 = ({r['beta']:.4f})^2 \times {r['mkt_annual_vol']**2:.4f} = {r['systematic_var']:.4f} \;\Rightarrow\; \text{{Systematic Risk}} = \sqrt{{{r['systematic_var']:.4f}}} = {r['systematic_risk']:.2f}\%")
+                st.markdown("**5. Unsystematic variance and risk** (subtract variances, then take the square root):")
+                st.latex(rf"\sigma_\epsilon^2 = \sigma_i^2 - \beta^2\sigma_m^2 = {r['total_var']:.4f} - {r['systematic_var']:.4f} = {r['raw_unsystematic_var']:.4f}")
+                if r['unsys_clipped']:
+                    st.latex(rf"\text{{Floored at 0}} \;\Rightarrow\; \sigma_\epsilon = \sqrt{{0}} = 0.00\%")
+                else:
+                    st.latex(rf"\sigma_\epsilon = \sqrt{{{r['unsystematic_var']:.4f}}} = {r['unsystematic_risk']:.2f}\%")
+                st.markdown("**6. Variance shares** (cross-checked against regression R²):")
+                st.latex(rf"\text{{Systematic Share}} = \frac{{\beta^2\sigma_m^2}}{{\sigma_i^2}} = \frac{{{r['systematic_var']:.4f}}}{{{r['total_var']:.4f}}} = {r['systematic_share']*100:.1f}\% \quad (\text{{Regression }} R^2 = {r['r_squared']*100:.1f}\%)")
+                st.latex(rf"\text{{Unsystematic Share}} = 1 - {r['systematic_share']*100:.1f}\% = {r['unsystematic_share']*100:.1f}\%")
+
             st.markdown("### Performance")
             c1,c2,c3,c4 = st.columns(4)
             c1.metric("Win Rate", f"{r['win_rate']:.1f}%")
@@ -341,12 +402,8 @@ if page == "Stock Analysis":
                 else: st.warning("Need 30+ points for rolling")
             with t6:
                 st.plotly_chart(plot_risk_decomp(r, ft), use_container_width=True)
-                st.markdown(
-                    f"**{ft}** total annualized risk of **{r['annual_vol']:.2f}%** splits into "
-                    f"**{r['systematic_risk']:.2f}%** systematic (market-driven, from β = {r['beta']:.3f} vs "
-                    f"{benchmark_name}'s {r['mkt_annual_vol']:.2f}% annual volatility) and "
-                    f"**{r['unsystematic_risk']:.2f}%** unsystematic (stock-specific/diversifiable) risk."
-                )
+                for line in interpret_risk_decomp(r, ft, benchmark_name):
+                    st.markdown(f"- {line}")
 
             # Downloads
             st.header("💾 Downloads")
