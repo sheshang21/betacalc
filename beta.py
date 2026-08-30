@@ -10,6 +10,8 @@ from scipy import stats
 import warnings
 import time
 import io
+import os
+import random
 
 warnings.filterwarnings('ignore')
 
@@ -48,6 +50,105 @@ def fetch_data(code, suffix, benchmark_ticker, start, end, freq='1d', retries=3)
         except:
             if i == retries-1: raise
     raise Exception("Failed")
+
+@st.cache_data(ttl=3600)
+def batch_fetch_closes(codes, suffix, start, end, freq):
+    """Batch-downloads Close prices for many tickers in a single yfinance call (much faster than
+    fetching one-by-one), so the app can auto-scan dozens of candidates for the diversifier search."""
+    tickers = [f"{c}{suffix}" for c in codes]
+    if not tickers:
+        return {}
+    raw = yf.download(tickers, start=start, end=end, interval=freq, group_by='ticker',
+                       threads=True, progress=False)
+    closes = {}
+    for c, tkr in zip(codes, tickers):
+        try:
+            if isinstance(raw.columns, pd.MultiIndex):
+                if tkr not in raw.columns.get_level_values(0):
+                    continue
+                s = raw[tkr]['Close']
+            else:
+                s = raw['Close'] if len(tickers) == 1 else None
+            if s is not None:
+                s = s.dropna()
+                if not s.empty:
+                    closes[tkr] = s
+        except Exception:
+            continue
+    return closes
+
+@st.cache_data
+def load_ticker_universe():
+    """Loads the bundled NSE/BSE ticker master lists shipped alongside this app."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    nse_path = os.path.join(base, "NSE_Tickers_List.csv")
+    bse_path = os.path.join(base, "BSE_Codes_List.csv")
+    nse_df = pd.read_csv(nse_path, encoding='utf-8-sig') if os.path.exists(nse_path) else None
+    bse_df = pd.read_csv(bse_path, encoding='utf-8-sig') if os.path.exists(bse_path) else None
+    if nse_df is not None:
+        nse_df['NSE Ticker'] = nse_df['NSE Ticker'].astype(str).str.strip()
+        nse_df['Name'] = nse_df['Name'].astype(str).str.strip()
+    if bse_df is not None:
+        bse_df['BSE Code'] = bse_df['BSE Code'].astype(str).str.strip()
+        bse_df['Name'] = bse_df['Name'].astype(str).str.strip()
+    return nse_df, bse_df
+
+def compute_correlations_from_closes(primary_rets, candidate_codes, suffix, closes):
+    """Given already-fetched Close price series, align each candidate's returns with the primary
+    stock and compute correlation. Lower/negative correlation = better diversification benefit."""
+    rows = []
+    for code in candidate_codes:
+        tkr = f"{code}{suffix}"
+        if tkr not in closes:
+            rows.append({'Ticker': tkr, 'Correlation': np.nan, 'Annual Vol %': np.nan,
+                         'Obs': 0, 'Status': 'No data returned'})
+            continue
+        cr = closes[tkr].pct_change() * 100
+        aligned = pd.DataFrame({'A': primary_rets['Stock_Return'], 'B': cr}).dropna()
+        if len(aligned) < 20:
+            rows.append({'Ticker': tkr, 'Correlation': np.nan, 'Annual Vol %': np.nan,
+                         'Obs': len(aligned), 'Status': 'Insufficient overlapping data'})
+            continue
+        corr = aligned['A'].corr(aligned['B'])
+        ann_vol = aligned['B'].std() * np.sqrt(252)
+        rows.append({'Ticker': tkr, 'Correlation': corr, 'Annual Vol %': ann_vol,
+                     'Obs': len(aligned), 'Status': 'OK'})
+    return pd.DataFrame(rows)
+
+def find_diversifiers(primary_rets, candidate_codes, suffix, start, end, freq):
+    """Single-batch correlation scan for a modest candidate list (one yfinance call)."""
+    closes = batch_fetch_closes(tuple(candidate_codes), suffix, start, end, freq)
+    return compute_correlations_from_closes(primary_rets, candidate_codes, suffix, closes)
+
+def scan_universe_chunked(primary_rets, all_codes, suffix, start, end, freq, chunk_size=200, progress_cb=None, pause=0.4):
+    """Scans an arbitrarily large candidate list (e.g. the whole exchange) by splitting it into
+    yfinance batch calls of `chunk_size` tickers each, with a short pause between chunks — this is
+    what makes a full-universe scan actually feasible without one request trying to pull thousands
+    of tickers at once and risking Yahoo's rate limits."""
+    chunks = [all_codes[i:i+chunk_size] for i in range(0, len(all_codes), chunk_size)]
+    closes = {}
+    for i, chunk in enumerate(chunks):
+        closes.update(batch_fetch_closes(tuple(chunk), suffix, start, end, freq))
+        if progress_cb: progress_cb(i + 1, len(chunks))
+        if pause and i < len(chunks) - 1: time.sleep(pause)
+    return compute_correlations_from_closes(primary_rets, all_codes, suffix, closes)
+
+def classify_diversifier(corr):
+    if pd.isna(corr): return "—"
+    if corr < 0: return "🟢 Strong diversifier (negative correlation)"
+    if corr < 0.3: return "🟢 Good diversifier (low correlation)"
+    if corr < 0.6: return "🟡 Moderate diversifier"
+    if corr < 0.85: return "🟠 Weak diversifier (moves mostly together)"
+    return "🔴 Poor diversifier (near-duplicate of the primary stock)"
+
+def two_stock_portfolio_risk(vol1, vol2, corr, w1=0.5, w2=0.5):
+    """Real portfolio-variance identity: sigma_p^2 = w1^2*s1^2 + w2^2*s2^2 + 2*w1*w2*rho*s1*s2.
+    Returns (portfolio_vol, weighted_avg_vol, diversification_benefit)."""
+    port_var = (w1**2)*(vol1**2) + (w2**2)*(vol2**2) + 2*w1*w2*corr*vol1*vol2
+    port_vol = np.sqrt(max(port_var, 0))
+    weighted_avg = w1*vol1 + w2*vol2
+    benefit = weighted_avg - port_vol
+    return port_vol, weighted_avg, benefit
 
 def calc_returns(stock, bench):
     sr = stock['Close'].pct_change() * 100
@@ -173,7 +274,7 @@ def interpret_risk_decomp(r, t, bench_name):
 
     return lines
 
-
+def plot_reg(rets, m, t, bench_name):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=rets['Bench_Return'], y=rets['Stock_Return'],
                             mode='markers', name='Returns', marker=dict(size=5, opacity=0.5)))
@@ -358,6 +459,115 @@ if page == "Stock Analysis":
                 st.markdown("**6. Variance shares** (cross-checked against regression R²):")
                 st.latex(rf"\text{{Systematic Share}} = \frac{{\beta^2\sigma_m^2}}{{\sigma_i^2}} = \frac{{{r['systematic_var']:.4f}}}{{{r['total_var']:.4f}}} = {r['systematic_share']*100:.1f}\% \quad (\text{{Regression }} R^2 = {r['r_squared']*100:.1f}\%)")
                 st.latex(rf"\text{{Unsystematic Share}} = 1 - {r['systematic_share']*100:.1f}\% = {r['unsystematic_share']*100:.1f}\%")
+
+            st.markdown("### 🔗 Auto-Discover Diversifying Stocks (Reduce Portfolio Unsystematic Risk)")
+            st.caption(
+                "To reduce unsystematic risk through diversification you want stocks with **low or negative** "
+                "correlation to this one — not high correlation. Two stocks that move together (high correlation) "
+                "give little diversification benefit, since their stock-specific swings tend to happen at the same time."
+            )
+            nse_universe, bse_universe = load_ticker_universe()
+            universe_df = nse_universe if exchange == "NSE" else bse_universe
+            code_col = "NSE Ticker" if exchange == "NSE" else "BSE Code"
+
+            if universe_df is None:
+                st.warning("⚠️ Ticker master list not found next to beta.py — place NSE_Tickers_List.csv / BSE_Codes_List.csv in the same folder as this app to enable this feature.")
+            else:
+                all_codes = [c for c in universe_df[code_col].tolist() if c.upper() != code.upper()]
+                n_universe = len(all_codes) + 1
+
+                scan_mode = st.radio(
+                    "Scan mode",
+                    ["Quick random sample", f"Entire {exchange} universe ({n_universe} tickers)"],
+                    horizontal=True,
+                    help="A full-universe scan fetches real data for every ticker on file, done in safe batches — "
+                         "it's just slower and has a small chance some tickers fail (delisted, no data, etc.)."
+                )
+                top_k = st.slider("Show top N diversifiers", 3, 15, 5)
+
+                if scan_mode == "Quick random sample":
+                    scan_n = st.slider("Random candidates to scan", 10, 200, 30, step=10)
+                    est_secs = scan_n * 0.3
+                    st.caption(f"Estimated time: ~{est_secs:.0f}s–{est_secs*3:.0f}s for {scan_n} tickers (one batch request).")
+                else:
+                    chunk_size = 200
+                    n_chunks = -(-len(all_codes) // chunk_size)  # ceil
+                    est_min_low, est_min_high = n_chunks * 3 / 60, n_chunks * 8 / 60
+                    st.caption(f"This will fetch all {len(all_codes)} candidates in {n_chunks} batches of {chunk_size}. "
+                               f"Estimated time: roughly {est_min_low:.1f}–{est_min_high:.1f} minutes, depending on Yahoo Finance response times. "
+                               "Results are cached for an hour, so re-running with a different primary stock afterward is instant.")
+
+                if st.button("🔍 Scan", type="primary", use_container_width=True):
+                    if scan_mode == "Quick random sample":
+                        sample_codes = random.sample(all_codes, min(scan_n, len(all_codes)))
+                        with st.spinner(f"Scanning {len(sample_codes)} {exchange} stocks for correlation with {ft}..."):
+                            st.session_state['div_df'] = find_diversifiers(rets, sample_codes, ex_conf["suffix"], start, end, freq)
+                            st.session_state['div_primary'] = ft
+                            st.session_state['div_scanned'] = len(sample_codes)
+                    else:
+                        prog = st.progress(0); stat = st.empty()
+                        def _cb(done, total):
+                            prog.progress(done/total)
+                            stat.info(f"Batch {done}/{total} fetched...")
+                        st.session_state['div_df'] = scan_universe_chunked(
+                            rets, all_codes, ex_conf["suffix"], start, end, freq,
+                            chunk_size=chunk_size, progress_cb=_cb)
+                        st.session_state['div_primary'] = ft
+                        st.session_state['div_scanned'] = len(all_codes)
+                        prog.empty(); stat.empty()
+
+                if st.session_state.get('div_primary') == ft and 'div_df' in st.session_state and not st.session_state['div_df'].empty:
+                    div_df = st.session_state['div_df'].copy()
+                    div_df['Diversification'] = div_df['Correlation'].apply(classify_diversifier)
+                    div_df = div_df.sort_values('Correlation', na_position='last')
+                    valid = div_df.dropna(subset=['Correlation'])
+                    n_scanned = st.session_state.get('div_scanned', len(div_df))
+                    n_valid = len(valid)
+
+                    if valid.empty:
+                        st.warning(f"None of the {n_scanned} scanned candidates returned usable price data (check Status in the full list below). Try scanning again.")
+                    else:
+                        st.success(f"Scanned {n_scanned} candidates · {n_valid} returned usable data · showing the {min(top_k, n_valid)} lowest-correlation picks below.")
+                        best_k = valid.head(top_k).copy()
+                        disp_best = best_k.copy()
+                        disp_best['Correlation'] = disp_best['Correlation'].apply(lambda x: f"{x:.4f}")
+                        disp_best['Annual Vol %'] = disp_best['Annual Vol %'].apply(lambda x: f"{x:.2f}%")
+                        st.dataframe(disp_best[['Ticker','Correlation','Annual Vol %','Diversification']],
+                                   use_container_width=True, hide_index=True)
+
+                        fig_corr = go.Figure()
+                        fig_corr.add_trace(go.Bar(
+                            x=best_k['Ticker'], y=best_k['Correlation'],
+                            marker_color=['#28a745' if c < 0.3 else '#ffc107' if c < 0.6 else '#dc3545' for c in best_k['Correlation']]))
+                        fig_corr.update_layout(title=f'Lowest Correlations with {ft} (of {n_valid} scanned)', yaxis_title='Correlation', height=400)
+                        st.plotly_chart(fig_corr, use_container_width=True)
+
+                        best = valid.iloc[0]
+                        st.markdown(f"**Best diversifier found:** {best['Ticker']} — ρ = {best['Correlation']:.4f} ({classify_diversifier(best['Correlation'])})")
+
+                        pv, wavg, benefit = two_stock_portfolio_risk(r['annual_vol'], best['Annual Vol %'], best['Correlation'])
+                        st.markdown(
+                            f"**Illustrative 50/50 portfolio** of {ft} (annual vol {r['annual_vol']:.2f}%) and "
+                            f"{best['Ticker']} (annual vol {best['Annual Vol %']:.2f}%) at ρ = {best['Correlation']:.4f}:"
+                        )
+                        st.latex(
+                            rf"\sigma_p=\sqrt{{0.5^2({r['annual_vol']:.2f})^2+0.5^2({best['Annual Vol %']:.2f})^2"
+                            rf"+2(0.5)(0.5)({best['Correlation']:.4f})({r['annual_vol']:.2f})({best['Annual Vol %']:.2f})}}={pv:.2f}\%"
+                        )
+                        st.markdown(
+                            f"A plain weighted average of the two stocks' volatilities is **{wavg:.2f}%**. Because ρ < 1, "
+                            f"the portfolio's actual combined volatility comes out lower, at **{pv:.2f}%** — a reduction of "
+                            f"**{benefit:.2f} percentage points** from diversification alone, with neither stock's own risk changing."
+                        )
+                        if best['Correlation'] >= 0.6:
+                            st.info(f"Even the best of the {n_scanned} scanned candidates was only moderately correlated. Scan a larger sample, or re-run — the sample is random each time.")
+
+                        with st.expander(f"See all {len(div_df)} scanned candidates"):
+                            disp_all = div_df.copy()
+                            disp_all['Correlation'] = disp_all['Correlation'].apply(lambda x: f"{x:.4f}" if pd.notna(x) else "—")
+                            disp_all['Annual Vol %'] = disp_all['Annual Vol %'].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "—")
+                            st.dataframe(disp_all[['Ticker','Correlation','Annual Vol %','Diversification','Obs','Status']],
+                                       use_container_width=True, hide_index=True)
 
             st.markdown("### Performance")
             c1,c2,c3,c4 = st.columns(4)
