@@ -95,24 +95,31 @@ def load_ticker_universe():
 
 def compute_correlations_from_closes(primary_rets, candidate_codes, suffix, closes):
     """Given already-fetched Close price series, align each candidate's returns with the primary
-    stock and compute correlation. Lower/negative correlation = better diversification benefit."""
+    stock and compute correlation. Lower/negative correlation = better diversification benefit.
+
+    Also flags thinly-traded candidates: a stock that doesn't trade every day shows up in Yahoo
+    Finance data as a flat (0.00%) daily return on the days it's stale. A high share of zero-return
+    days artificially drags the computed correlation toward 0 — it looks like a great diversifier
+    but it's really just a data artifact (non-synchronous/stale-price bias), not real diversification."""
     rows = []
     for code in candidate_codes:
         tkr = f"{code}{suffix}"
         if tkr not in closes:
             rows.append({'Ticker': tkr, 'Correlation': np.nan, 'Annual Vol %': np.nan,
-                         'Obs': 0, 'Status': 'No data returned'})
+                         'Obs': 0, 'Zero-Return %': np.nan, 'Status': 'No data returned'})
             continue
         cr = closes[tkr].pct_change() * 100
         aligned = pd.DataFrame({'A': primary_rets['Stock_Return'], 'B': cr}).dropna()
         if len(aligned) < 20:
             rows.append({'Ticker': tkr, 'Correlation': np.nan, 'Annual Vol %': np.nan,
-                         'Obs': len(aligned), 'Status': 'Insufficient overlapping data'})
+                         'Obs': len(aligned), 'Zero-Return %': np.nan, 'Status': 'Insufficient overlapping data'})
             continue
+        zero_frac = (aligned['B'] == 0).mean() * 100
         corr = aligned['A'].corr(aligned['B'])
         ann_vol = aligned['B'].std() * np.sqrt(252)
+        status = f'Illiquid — {zero_frac:.0f}% zero-return days (stale pricing)' if zero_frac >= 25 else 'OK'
         rows.append({'Ticker': tkr, 'Correlation': corr, 'Annual Vol %': ann_vol,
-                     'Obs': len(aligned), 'Status': 'OK'})
+                     'Obs': len(aligned), 'Zero-Return %': zero_frac, 'Status': status})
     return pd.DataFrame(rows)
 
 def find_diversifiers(primary_rets, candidate_codes, suffix, start, end, freq):
@@ -133,8 +140,10 @@ def scan_universe_chunked(primary_rets, all_codes, suffix, start, end, freq, chu
         if pause and i < len(chunks) - 1: time.sleep(pause)
     return compute_correlations_from_closes(primary_rets, all_codes, suffix, closes)
 
-def classify_diversifier(corr):
+def classify_diversifier(corr, zero_frac=None):
     if pd.isna(corr): return "—"
+    if zero_frac is not None and pd.notna(zero_frac) and zero_frac >= 25:
+        return f"⚪ Unreliable — {zero_frac:.0f}% stale/zero-return days, not a real diversification signal"
     if corr < 0: return "🟢 Strong diversifier (negative correlation)"
     if corr < 0.3: return "🟢 Good diversifier (low correlation)"
     if corr < 0.6: return "🟡 Moderate diversifier"
@@ -421,6 +430,44 @@ if page == "Stock Analysis":
             if 'rate limit' in str(e).lower():
                 st.warning("💡 Try: Wait 1-2 min, use Weekly/Monthly, shorter range, or clear cache")
 
+    # --- Diversifier Scan controls, in the sidebar, shown once an analysis exists ---
+    scan_mode = top_k = scan_n = chunk_size = None
+    scan_requested = False
+    universe_available = False
+    all_codes = []
+    if 'stock_analysis' in st.session_state:
+        _a = st.session_state['stock_analysis']
+        _exchange, _code = _a['exchange'], _a['code']
+        _nse_universe, _bse_universe = load_ticker_universe()
+        _universe_df = _nse_universe if _exchange == "NSE" else _bse_universe
+        _code_col = "NSE Ticker" if _exchange == "NSE" else "BSE Code"
+        if _universe_df is not None:
+            universe_available = True
+            all_codes = [c for c in _universe_df[_code_col].tolist() if c.upper() != _code.upper()]
+            n_universe = len(all_codes) + 1
+
+            st.sidebar.markdown("---")
+            st.sidebar.header("🔗 Diversifier Scan")
+            st.sidebar.caption(f"Finds stocks with low correlation to {_a['ft']}.")
+            scan_mode = st.sidebar.radio(
+                "Scan mode",
+                ["Quick random sample", f"Entire {_exchange} universe ({n_universe} tickers)"],
+                help="A full-universe scan fetches real data for every ticker on file, done in safe batches — "
+                     "it's just slower and has a small chance some tickers fail (delisted, no data, etc.)."
+            )
+            top_k = st.sidebar.slider("Show top N diversifiers", 3, 15, 5)
+            if scan_mode == "Quick random sample":
+                scan_n = st.sidebar.slider("Random candidates to scan", 10, 200, 30, step=10)
+                est_secs = scan_n * 0.3
+                st.sidebar.caption(f"Estimated time: ~{est_secs:.0f}s–{est_secs*3:.0f}s for {scan_n} tickers.")
+            else:
+                chunk_size = 200
+                n_chunks = -(-len(all_codes) // chunk_size)  # ceil
+                est_min_low, est_min_high = n_chunks * 3 / 60, n_chunks * 8 / 60
+                st.sidebar.caption(f"~{len(all_codes)} candidates in {n_chunks} batches. "
+                                    f"Est. {est_min_low:.1f}–{est_min_high:.1f} min.")
+            scan_requested = st.sidebar.button("🔍 Scan", type="primary", use_container_width=True)
+
     if 'stock_analysis' in st.session_state:
         a = st.session_state['stock_analysis']
         s, n, ft, rets, r, m = a['s'], a['n'], a['ft'], a['rets'], a['r'], a['m']
@@ -488,40 +535,17 @@ if page == "Stock Analysis":
         st.caption(
             "To reduce unsystematic risk through diversification you want stocks with **low or negative** "
             "correlation to this one — not high correlation. Two stocks that move together (high correlation) "
-            "give little diversification benefit, since their stock-specific swings tend to happen at the same time."
+            "give little diversification benefit, since their stock-specific swings tend to happen at the same time. "
+            "Candidates that barely trade (many zero-change days) are flagged separately below — a flat price isn't "
+            "real diversification, it's stale data."
         )
-        nse_universe, bse_universe = load_ticker_universe()
-        universe_df = nse_universe if exchange == "NSE" else bse_universe
-        code_col = "NSE Ticker" if exchange == "NSE" else "BSE Code"
 
-        if universe_df is None:
+        if not universe_available:
             st.warning("⚠️ Ticker master list not found next to beta.py — place NSE_Tickers_List.csv / BSE_Codes_List.csv in the same folder as this app to enable this feature.")
         else:
-            all_codes = [c for c in universe_df[code_col].tolist() if c.upper() != code.upper()]
-            n_universe = len(all_codes) + 1
+            st.caption("Scan settings are in the sidebar under **🔗 Diversifier Scan**.")
 
-            scan_mode = st.radio(
-                "Scan mode",
-                ["Quick random sample", f"Entire {exchange} universe ({n_universe} tickers)"],
-                horizontal=True,
-                help="A full-universe scan fetches real data for every ticker on file, done in safe batches — "
-                     "it's just slower and has a small chance some tickers fail (delisted, no data, etc.)."
-            )
-            top_k = st.slider("Show top N diversifiers", 3, 15, 5)
-
-            if scan_mode == "Quick random sample":
-                scan_n = st.slider("Random candidates to scan", 10, 200, 30, step=10)
-                est_secs = scan_n * 0.3
-                st.caption(f"Estimated time: ~{est_secs:.0f}s–{est_secs*3:.0f}s for {scan_n} tickers (one batch request).")
-            else:
-                chunk_size = 200
-                n_chunks = -(-len(all_codes) // chunk_size)  # ceil
-                est_min_low, est_min_high = n_chunks * 3 / 60, n_chunks * 8 / 60
-                st.caption(f"This will fetch all {len(all_codes)} candidates in {n_chunks} batches of {chunk_size}. "
-                           f"Estimated time: roughly {est_min_low:.1f}–{est_min_high:.1f} minutes, depending on Yahoo Finance response times. "
-                           "Results are cached for an hour, so re-running with a different primary stock afterward is instant.")
-
-            if st.button("🔍 Scan", type="primary", use_container_width=True):
+            if scan_requested:
                 if scan_mode == "Quick random sample":
                     sample_codes = random.sample(all_codes, min(scan_n, len(all_codes)))
                     with st.spinner(f"Scanning {len(sample_codes)} {exchange} stocks for correlation with {ft}..."):
@@ -542,17 +566,24 @@ if page == "Stock Analysis":
 
             if st.session_state.get('div_primary') == ft and 'div_df' in st.session_state and not st.session_state['div_df'].empty:
                 div_df = st.session_state['div_df'].copy()
-                div_df['Diversification'] = div_df['Correlation'].apply(classify_diversifier)
+                div_df['Diversification'] = div_df.apply(
+                    lambda row: classify_diversifier(row['Correlation'], row.get('Zero-Return %')), axis=1)
                 div_df = div_df.sort_values('Correlation', na_position='last')
-                valid = div_df.dropna(subset=['Correlation'])
+                valid_all = div_df.dropna(subset=['Correlation'])
+                # Exclude thinly-traded candidates from the "best diversifier" ranking — their low
+                # correlation is a stale-pricing artifact, not a genuine diversification signal.
+                reliable = valid_all[valid_all['Zero-Return %'] < 25]
                 n_scanned = st.session_state.get('div_scanned', len(div_df))
-                n_valid = len(valid)
+                n_valid = len(reliable)
+                n_stale = len(valid_all) - n_valid
 
-                if valid.empty:
-                    st.warning(f"None of the {n_scanned} scanned candidates returned usable price data (check Status in the full list below). Try scanning again.")
+                if reliable.empty:
+                    st.warning(f"None of the {n_scanned} scanned candidates had both usable price data and enough trading "
+                               f"activity for a reliable correlation (check Status in the full list below). Try a larger sample.")
                 else:
-                    st.success(f"Scanned {n_scanned} candidates · {n_valid} returned usable data · showing the {min(top_k, n_valid)} lowest-correlation picks below.")
-                    best_k = valid.head(top_k).copy()
+                    stale_note = f" · {n_stale} excluded as illiquid/stale-priced" if n_stale else ""
+                    st.success(f"Scanned {n_scanned} candidates · {n_valid} reliable{stale_note} · showing the {min(top_k, n_valid)} lowest-correlation picks below.")
+                    best_k = reliable.head(top_k).copy()
                     disp_best = best_k.copy()
                     disp_best['Correlation'] = disp_best['Correlation'].apply(lambda x: f"{x:.4f}")
                     disp_best['Annual Vol %'] = disp_best['Annual Vol %'].apply(lambda x: f"{x:.2f}%")
@@ -563,11 +594,11 @@ if page == "Stock Analysis":
                     fig_corr.add_trace(go.Bar(
                         x=best_k['Ticker'], y=best_k['Correlation'],
                         marker_color=['#28a745' if c < 0.3 else '#ffc107' if c < 0.6 else '#dc3545' for c in best_k['Correlation']]))
-                    fig_corr.update_layout(title=f'Lowest Correlations with {ft} (of {n_valid} scanned)', yaxis_title='Correlation', height=400)
+                    fig_corr.update_layout(title=f'Lowest Correlations with {ft} (of {n_valid} reliable candidates)', yaxis_title='Correlation', height=400)
                     st.plotly_chart(fig_corr, use_container_width=True)
 
-                    best = valid.iloc[0]
-                    st.markdown(f"**Best diversifier found:** {best['Ticker']} — ρ = {best['Correlation']:.4f} ({classify_diversifier(best['Correlation'])})")
+                    best = reliable.iloc[0]
+                    st.markdown(f"**Best diversifier found:** {best['Ticker']} — ρ = {best['Correlation']:.4f} ({classify_diversifier(best['Correlation'], best['Zero-Return %'])})")
 
                     pv, wavg, benefit = two_stock_portfolio_risk(r['annual_vol'], best['Annual Vol %'], best['Correlation'])
                     st.markdown(
@@ -585,12 +616,16 @@ if page == "Stock Analysis":
                     )
                     if best['Correlation'] >= 0.6:
                         st.info(f"Even the best of the {n_scanned} scanned candidates was only moderately correlated. Scan a larger sample, or re-run — the sample is random each time.")
+                    if n_stale:
+                        st.caption(f"⚪ {n_stale} candidate(s) were excluded from ranking for trading on fewer than ~75% of overlapping "
+                                   f"days — their apparent low correlation reflects stale pricing, not diversification. See the full list below.")
 
                     with st.expander(f"See all {len(div_df)} scanned candidates"):
                         disp_all = div_df.copy()
                         disp_all['Correlation'] = disp_all['Correlation'].apply(lambda x: f"{x:.4f}" if pd.notna(x) else "—")
                         disp_all['Annual Vol %'] = disp_all['Annual Vol %'].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "—")
-                        st.dataframe(disp_all[['Ticker','Correlation','Annual Vol %','Diversification','Obs','Status']],
+                        disp_all['Zero-Return %'] = disp_all['Zero-Return %'].apply(lambda x: f"{x:.0f}%" if pd.notna(x) else "—")
+                        st.dataframe(disp_all[['Ticker','Correlation','Annual Vol %','Zero-Return %','Diversification','Obs','Status']],
                                    use_container_width=True, hide_index=True)
 
         st.markdown("### Performance")
