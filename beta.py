@@ -70,6 +70,8 @@ def calc_metrics(stock, bench, rets, rf=6.5):
     r['cum_ret'] = ((1 + rets['Stock_Return']/100).prod() - 1) * 100
     r['mkt_mean'] = rets['Bench_Return'].mean()
     r['mkt_annual'] = r['mkt_mean'] * 252
+    r['mkt_vol'] = rets['Bench_Return'].std()
+    r['mkt_annual_vol'] = r['mkt_vol'] * np.sqrt(252)
     r['excess'] = r['mean_ret'] - r['mkt_mean']
     daily_rf = rf/252
     r['sharpe'] = (r['mean_ret'] - daily_rf) / r['volatility']
@@ -101,6 +103,15 @@ def calc_metrics(stock, bench, rets, rf=6.5):
     r['pct_high'] = (r['price'] / r['high52']) * 100
     r['corr'] = rets['Stock_Return'].corr(rets['Bench_Return'])
     r['obs'] = len(rets)
+
+    # --- Systematic vs Unsystematic risk decomposition (sigma_i^2 = beta^2*sigma_m^2 + sigma_eps^2) ---
+    r['total_var'] = r['annual_vol'] ** 2
+    r['systematic_var'] = (r['beta'] ** 2) * (r['mkt_annual_vol'] ** 2)
+    r['unsystematic_var'] = max(r['total_var'] - r['systematic_var'], 0)
+    r['systematic_risk'] = np.sqrt(r['systematic_var'])          # beta * sigma_m, annualized
+    r['unsystematic_risk'] = np.sqrt(r['unsystematic_var'])      # sqrt(sigma_i^2 - beta^2*sigma_m^2)
+    r['systematic_share'] = r['systematic_var'] / r['total_var'] if r['total_var'] != 0 else 0  # ~ R^2
+    r['unsystematic_share'] = 1 - r['systematic_share']
     return r, m
 
 def recommend(r):
@@ -157,6 +168,22 @@ def plot_dd(rets, t):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=dd.index, y=dd, fill='tozeroy', name='Drawdown', line=dict(color='red')))
     fig.update_layout(title='Drawdown', height=500)
+    return fig
+
+def plot_risk_decomp(r, t):
+    from plotly.subplots import make_subplots
+    fig = make_subplots(rows=1, cols=2, specs=[[{'type':'domain'}, {'type':'xy'}]],
+                         subplot_titles=('Variance Share', 'Annualized Risk (%)'))
+    fig.add_trace(go.Pie(labels=['Systematic', 'Unsystematic'],
+                          values=[r['systematic_share']*100, r['unsystematic_share']*100],
+                          hole=0.55, marker=dict(colors=['#1f77b4', '#ff7f0e']),
+                          textinfo='label+percent'), row=1, col=1)
+    fig.add_trace(go.Bar(x=['Total', 'Systematic', 'Unsystematic'],
+                          y=[r['annual_vol'], r['systematic_risk'], r['unsystematic_risk']],
+                          marker_color=['#6c757d', '#1f77b4', '#ff7f0e'],
+                          text=[f"{v:.2f}%" for v in [r['annual_vol'], r['systematic_risk'], r['unsystematic_risk']]],
+                          textposition='outside'), row=1, col=2)
+    fig.update_layout(title=f'{t}: Systematic vs Unsystematic Risk', height=450, showlegend=False)
     return fig
 
 def plot_rolling(rets, ws, t):
@@ -263,6 +290,14 @@ if page == "Stock Analysis":
             c3.metric("VaR 95%", f"{r['var_95']:.2f}%")
             c4.metric("Sortino", f"{r['sortino']:.4f}")
 
+            st.markdown("### 🧩 Risk Decomposition (Systematic vs Unsystematic)")
+            st.caption(r"σᵢ² = β²σₘ² + σε²  ·  Systematic share ≈ R²")
+            c1,c2,c3,c4 = st.columns(4)
+            c1.metric("Systematic Risk", f"{r['systematic_risk']:.2f}%", help="β × σ(market), annualized")
+            c2.metric("Unsystematic Risk", f"{r['unsystematic_risk']:.2f}%", help="√(σᵢ² − β²σₘ²), annualized")
+            c3.metric("Systematic Share", f"{r['systematic_share']*100:.1f}%", help="Systematic variance / Total variance ≈ R²")
+            c4.metric("Unsystematic Share", f"{r['unsystematic_share']*100:.1f}%", help="1 − Systematic Share")
+
             st.markdown("### Performance")
             c1,c2,c3,c4 = st.columns(4)
             c1.metric("Win Rate", f"{r['win_rate']:.1f}%")
@@ -273,10 +308,11 @@ if page == "Stock Analysis":
             # Full stats table
             st.subheader("📋 Complete Statistics")
             stats_df = pd.DataFrame({
-                'Category': ['Beta']*4 + ['Returns']*4 + ['Risk']*6 + ['Ratios']*4 + ['Dist']*3 + ['Price']*4,
+                'Category': ['Beta']*4 + ['Returns']*4 + ['Risk']*6 + ['Risk Decomposition']*4 + ['Ratios']*4 + ['Dist']*3 + ['Price']*4,
                 'Metric': ['Beta','Alpha','R²','Correlation',
                           'Daily Return','Annual Return','Cumulative','Excess',
                           'Daily Vol','Annual Vol','Downside Dev','Max DD','VaR 95%','CVaR 95%',
+                          'Systematic Risk','Unsystematic Risk','Systematic Share','Unsystematic Share',
                           'Sharpe','Sortino','Treynor','Info Ratio',
                           'Skewness','Kurtosis','Tracking Error',
                           'Current','52W High','52W Low','% to High'],
@@ -284,6 +320,8 @@ if page == "Stock Analysis":
                          f"{r['mean_ret']:.4f}%", f"{r['annual_ret']:.2f}%", f"{r['cum_ret']:.2f}%", f"{r['excess']:.4f}%",
                          f"{r['volatility']:.4f}%", f"{r['annual_vol']:.2f}%", f"{r['downside_dev']:.4f}%",
                          f"{r['max_dd']:.2f}%", f"{r['var_95']:.2f}%", f"{r['cvar_95']:.2f}%",
+                         f"{r['systematic_risk']:.2f}%", f"{r['unsystematic_risk']:.2f}%",
+                         f"{r['systematic_share']*100:.1f}%", f"{r['unsystematic_share']*100:.1f}%",
                          f"{r['annual_sharpe']:.4f}", f"{r['sortino']:.4f}", f"{r['treynor']:.2f}", f"{r['info_ratio']:.4f}",
                          f"{r['skew']:.4f}", f"{r['kurt']:.4f}", f"{r['tracking_error']:.2f}%",
                          f"₹{r['price']:.2f}", f"₹{r['high52']:.2f}", f"₹{r['low52']:.2f}", f"{r['pct_high']:.1f}%"]
@@ -292,7 +330,7 @@ if page == "Stock Analysis":
 
             # Charts
             st.header("📊 Visualizations")
-            t1,t2,t3,t4,t5 = st.tabs(["Regression", "Distribution", "Cumulative", "Drawdown", "Rolling"])
+            t1,t2,t3,t4,t5,t6 = st.tabs(["Regression", "Distribution", "Cumulative", "Drawdown", "Rolling", "Risk Decomposition"])
             with t1: st.plotly_chart(plot_reg(rets, m, ft, benchmark_name), use_container_width=True)
             with t2: st.plotly_chart(plot_dist(rets, ft, benchmark_name), use_container_width=True)
             with t3: st.plotly_chart(plot_cum(rets, ft, benchmark_name), use_container_width=True)
@@ -301,6 +339,14 @@ if page == "Stock Analysis":
                 ws = [30, 90, 180] if len(rets) >= 180 else ([30, 90] if len(rets) >= 90 else [30])
                 if len(rets) >= 30: st.plotly_chart(plot_rolling(rets, ws, ft), use_container_width=True)
                 else: st.warning("Need 30+ points for rolling")
+            with t6:
+                st.plotly_chart(plot_risk_decomp(r, ft), use_container_width=True)
+                st.markdown(
+                    f"**{ft}** total annualized risk of **{r['annual_vol']:.2f}%** splits into "
+                    f"**{r['systematic_risk']:.2f}%** systematic (market-driven, from β = {r['beta']:.3f} vs "
+                    f"{benchmark_name}'s {r['mkt_annual_vol']:.2f}% annual volatility) and "
+                    f"**{r['unsystematic_risk']:.2f}%** unsystematic (stock-specific/diversifiable) risk."
+                )
 
             # Downloads
             st.header("💾 Downloads")
@@ -382,6 +428,16 @@ else:  # Formulas
     st.subheader("2. Beta (Regression)")
     st.latex(r"R_{stock} = \alpha + \beta R_{market} + \epsilon")
     st.latex(r"\beta = \frac{Cov(R_s, R_m)}{Var(R_m)}")
+
+    st.subheader("2b. Total Risk = Systematic + Unsystematic Risk")
+    st.latex(r"\sigma_i^2 = \beta_i^2\sigma_m^2 + \sigma_\epsilon^2")
+    st.markdown("**Systematic risk** — the portion driven by overall market movements:")
+    st.latex(r"\text{Systematic Variance} = \beta^2\sigma_m^2 \qquad \text{Systematic Risk} = \beta\sigma_m")
+    st.markdown("**Unsystematic risk** — the stock-specific/diversifiable residual, found by subtracting *variances* (never subtract standard deviations directly):")
+    st.latex(r"\sigma_\epsilon = \sqrt{\sigma_i^2 - \beta^2\sigma_m^2}")
+    st.markdown("**R²-based decomposition** — from the regression, R² is exactly the systematic share of total variance:")
+    st.latex(r"R^2 = \frac{\text{Systematic Variance}}{\text{Total Variance}} \qquad \text{Unsystematic Share} = 1 - R^2")
+    st.markdown("Both approaches are computed for every stock analyzed on this app — see the *Risk Decomposition* tab under Visualizations.")
 
     st.subheader("3. Sharpe Ratio")
     st.latex(r"Sharpe = \frac{R_p - R_f}{\sigma_p}")
